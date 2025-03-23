@@ -5,6 +5,7 @@ import boto3
 from api_request_schema import api_request_list, get_model_ids
 import pytesseract
 from PIL import Image
+from langdetect import detect
 
 # 基础配置
 model_id = os.getenv('MODEL_ID', 'meta.llama3-70b-instruct-v1')
@@ -44,6 +45,18 @@ class BedrockWrapper:
         model_provider = model_id.split('.')[0]
         body = config['bedrock']['api_request']['body']
 
+        # 检测输入语言
+        try:
+            detected_language = detect(text)
+            #print(f"检测到的语言: {detected_language}")
+        except Exception as e:
+            print(f"语言检测失败: {e}")
+            detected_language = 'zh-cn'  # 默认中文
+        
+        # 根据检测到的语言设置输出语言
+        output_language = 'Chinese' if detected_language == 'zh-cn' else 'English'
+        #print(f"设置的输出语言: {output_language}")
+
         if model_provider == 'amazon':
             body['inputText'] = text
         elif model_provider == 'meta':
@@ -56,7 +69,7 @@ class BedrockWrapper:
                     <|begin_of_text|>
                     {conversation}
                     <|start_header_id|>user<|end_header_id|>
-                    {text}, please output in Chinese.
+                    {text}, please output in {output_language}.
                     <|eot_id|>
                     <|start_header_id|>assistant<|end_header_id|>
                     """
@@ -66,7 +79,7 @@ class BedrockWrapper:
                     else msg['content']
                     for msg in history
                 ])
-                body['prompt'] = f"<s>{conversation}[INST] {text}, please output in Chinese. [/INST]"
+                body['prompt'] = f"<s>{conversation}[INST] {text}, please output in {output_language}. [/INST]"
         elif model_provider == 'anthropic':
             if "claude-3" in model_id:
                 body['messages'] = history + [{"role": "user", "content": text}]
@@ -90,7 +103,7 @@ class BedrockWrapper:
                 else msg['content']
                 for msg in history
             ])
-            body['prompt'] = f"<s>{conversation}[INST] {text}, please output in Chinese. [/INST]"
+            body['prompt'] = f"<s>{conversation}[INST] {text}, please output in {output_language}. [/INST]"
         else:
             raise Exception('未知的模型提供商。')
 
