@@ -1,92 +1,84 @@
-import asyncio
 import json
 import os
-import time
-import pyaudio
 import sys
 import boto3
-import sounddevice
-
-from concurrent.futures import ThreadPoolExecutor
-from amazon_transcribe.client import TranscribeStreamingClient
-from amazon_transcribe.handlers import TranscriptResultStreamHandler
-from amazon_transcribe.model import TranscriptEvent, TranscriptResultStream
-
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 from api_request_schema import api_request_list, get_model_ids
 
+# 基础配置
 model_id = os.getenv('MODEL_ID', 'meta.llama3-70b-instruct-v1')
 aws_region = os.getenv('AWS_REGION', 'us-east-1')
 
 if model_id not in get_model_ids():
-    print(f'Error: Models ID {model_id} in not a valid model ID. Set MODEL_ID env var to one of {get_model_ids()}.')
+    print(f'错误：模型ID {model_id} 不是有效的模型ID。请将 MODEL_ID 环境变量设置为以下之一: {get_model_ids()}')
     sys.exit(0)
 
 api_request = api_request_list[model_id]
 config = {
-    'log_level': 'none',  # One of: info, debug, none
-    #'last_speech': "If you have any other questions, please don't hesitate to ask. Have a great day!",
+    'log_level': 'none',
     'region': aws_region,
-    'polly': {
-        'Engine': 'neural',
-        'LanguageCode': 'cmn-CN',
-        'VoiceId': 'Zhiyu',
-        'OutputFormat': 'pcm',
-    },
     'bedrock': {
         'api_request': api_request
     }
 }
 
-
-p = pyaudio.PyAudio()
-bedrock_runtime = boto3.client(service_name='bedrock-runtime', region_name=config['region'])
-polly = boto3.client('polly', region_name=config['region'])
-transcribe_streaming = TranscribeStreamingClient(region=config['region'])
-
-
+# 定义 printer 函数
 def printer(text, level):
     if config['log_level'] == 'info' and level == 'info':
         print(text)
     elif config['log_level'] == 'debug' and level in ['info', 'debug']:
         print(text)
 
+bedrock_runtime = boto3.client(service_name='bedrock-runtime', region_name=config['region'])
 
-class UserInputManager:
-    shutdown_executor = False
-    executor = None
+# 加载《红楼梦》全文
+def load_hongloumeng_text():
+    file_path = r'C:\Users\31822\FreshmanCup\docs\honglou.txt'
+    with open(file_path, 'r', encoding='utf-8') as file:
+        return file.read()
 
-    @staticmethod
-    def set_executor(executor):
-        UserInputManager.executor = executor
+# 分割文本为段落
+def split_text_into_passages(text, passage_length=100):
+    words = text.split()
+    passages = [' '.join(words[i:i + passage_length]) for i in range(0, len(words), passage_length)]
+    return passages
 
-    @staticmethod
-    def start_shutdown_executor():
-        UserInputManager.shutdown_executor = False
-        raise Exception()  # Workaround to shutdown exec, as executor.shutdown() doesn't work as expected.
+# 生成嵌入并构建FAISS索引
+def build_faiss_index(passages):
+    model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    passage_embeddings = model.encode(passages)
+    dimension = passage_embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(passage_embeddings)
+    return index, model, passages
 
-    @staticmethod
-    def start_user_input_loop():
-        while True:
-            sys.stdin.readline().strip()
-            printer(f'[DEBUG] User input to shut down executor...', 'debug')
-            UserInputManager.shutdown_executor = True
+# 检索最相关的段落
+def retrieve_relevant_passages(query, index, model, passages, top_k=1):
+    query_embedding = model.encode([query])
+    distances, indices = index.search(query_embedding, top_k)
+    relevant_passages = [passages[i] for i in indices[0]]
+    return relevant_passages
 
-    @staticmethod
-    def is_executor_set():
-        return UserInputManager.executor is not None
+class BedrockWrapper:
+    def __init__(self):
+        self.conversation_history = []
+        # 加载《红楼梦》全文并构建FAISS索引
+        self.hongloumeng_text = load_hongloumeng_text()
+        self.passages = split_text_into_passages(self.hongloumeng_text)
+        self.index, self.embedding_model, self.passages = build_faiss_index(self.passages)
 
-    @staticmethod
-    def is_shutdown_scheduled():
-        return UserInputManager.shutdown_executor
-
-
-class BedrockModelsWrapper:
-
-    @staticmethod
-    def define_body(text):
+    def define_body(self, text, context=None):
         model_id = config['bedrock']['api_request']['modelId']
         model_provider = model_id.split('.')[0]
         body = config['bedrock']['api_request']['body']
+
+        # 将对话历史和检索到的上下文添加到当前输入
+        if self.conversation_history:
+            text = "\n".join(self.conversation_history) + "\n" + text
+        if context:
+            text = f"上下文:\n{context}\n\n问题:\n{text}"
 
         if model_provider == 'amazon':
             body['inputText'] = text
@@ -116,371 +108,98 @@ class BedrockModelsWrapper:
         elif model_provider == 'mistral':
             body['prompt'] = f"<s>[INST] {text}, please output in Chinese. [/INST]"
         else:
-            raise Exception('Unknown model provider.')
+            raise Exception('未知的模型提供商。')
 
         return body
 
     @staticmethod
-    def get_stream_chunk(event):
-        return event.get('chunk')
-
-    @staticmethod
-    def get_stream_text(chunk):
+    def get_response_text(chunk):
         model_id = config['bedrock']['api_request']['modelId']
         model_provider = model_id.split('.')[0]
-
-        chunk_obj = ''
-        text = ''
+        
+        chunk_obj = json.loads(chunk.get('bytes').decode())
+        
         if model_provider == 'amazon':
-            chunk_obj = json.loads(chunk.get('bytes').decode())
-            text = chunk_obj['outputText']
+            return chunk_obj['outputText']
         elif model_provider == 'meta':
-            chunk_obj = json.loads(chunk.get('bytes').decode())
-            text = chunk_obj['generation']
+            return chunk_obj['generation']
         elif model_provider == 'anthropic':
             if "claude-3" in model_id:
-                chunk_obj = json.loads(chunk.get('bytes').decode())
-                if chunk_obj['type'] == 'message_delta':
-                    print(f"\nStop reason: {chunk_obj['delta']['stop_reason']}")
-                    print(f"Stop sequence: {chunk_obj['delta']['stop_sequence']}")
-                    print(f"Output tokens: {chunk_obj['usage']['output_tokens']}")
-
                 if chunk_obj['type'] == 'content_block_delta':
                     if chunk_obj['delta']['type'] == 'text_delta':
-                        #print(chunk_obj['delta']['text'], end="")
-                        text = chunk_obj['delta']['text']
-            else:
-                #Claude2.x
-                chunk_obj = json.loads(chunk.get('bytes').decode())
-                text = chunk_obj['completion']
+                        return chunk_obj['delta']['text']
+                return ''
+            return chunk_obj['completion']
         elif model_provider == 'cohere':
-            chunk_obj = json.loads(chunk.get('bytes').decode())
-            text = ' '.join([c["text"] for c in chunk_obj['generations']])
+            return ' '.join([c["text"] for c in chunk_obj['generations']])
         elif model_provider == 'mistral':
-            chunk_obj = json.loads(chunk.get('bytes').decode())
-            text = chunk_obj['outputs'][0]['text']
+            return chunk_obj['outputs'][0]['text']
         else:
-            raise NotImplementedError('Unknown model provider.')
+            raise Exception('未知的模型提供商。')
 
-        printer(f'[DEBUG] {chunk_obj}', 'debug')
-        return text
-
-
-def to_audio_generator(bedrock_stream):
-    prefix = ''
-
-    if bedrock_stream:
-        for event in bedrock_stream:
-            chunk = BedrockModelsWrapper.get_stream_chunk(event)
-            if chunk:
-                text = BedrockModelsWrapper.get_stream_text(chunk)
-
-                if '.' in text:
-                    a = text.split('.')[:-1]
-                    to_polly = ''.join([prefix, '.'.join(a), '. '])
-                    prefix = text.split('.')[-1]
-                    print(to_polly, flush=True, end='')
-                    yield to_polly
-                else:
-                    prefix = ''.join([prefix, text])
-
-        if prefix != '':
-            print(prefix, flush=True, end='')
-            yield f'{prefix}.'
-
-        print('\n')
-
-
-class BedrockWrapper:
-
-    def __init__(self):
-        self.speaking = False
-
-    def is_speaking(self):
-        return self.speaking
-
-    def invoke_bedrock(self, text):
-        printer('[DEBUG] Bedrock generation started', 'debug')
-        self.speaking = True
-
-        body = BedrockModelsWrapper.define_body(text)
-        printer(f"[DEBUG] Request body: {body}", 'debug')
-
+    def chat(self, text):
         try:
-            body_json = json.dumps(body)
+            # 检索最相关的段落
+            relevant_passages = retrieve_relevant_passages(text, self.index, self.embedding_model, self.passages)
+            context = "\n".join(relevant_passages)
+
+            # 生成回答
+            body = self.define_body(text, context)
+            printer(f"[DEBUG] Request body: {body}", 'debug')
+            
             response = bedrock_runtime.invoke_model_with_response_stream(
-                body=body_json,
+                body=json.dumps(body),
                 modelId=config['bedrock']['api_request']['modelId'],
                 accept=config['bedrock']['api_request']['accept'],
                 contentType=config['bedrock']['api_request']['contentType']
             )
 
-            printer('[DEBUG] Capturing Bedrocks response/bedrock_stream', 'debug')
-            bedrock_stream = response.get('body')
-            printer(f"[DEBUG] Bedrock_stream: {bedrock_stream}", 'debug')
-
-            audio_gen = to_audio_generator(bedrock_stream)
-            printer('[DEBUG] Created bedrock stream to audio generator', 'debug')
-
-            reader = Reader()
-            for audio in audio_gen:
-                reader.read(audio)
-
-            reader.close()
-
-        except Exception as e:
-            print(e)
-            time.sleep(2)
-            self.speaking = False
-
-        time.sleep(1)
-        self.speaking = False
-        printer('\n[DEBUG] Bedrock generation completed', 'debug')
-
-
-class Reader:
-
-    def __init__(self):
-        self.polly = boto3.client('polly', region_name=config['region'])
-        self.audio = p.open(format=pyaudio.paInt16, channels=1, rate=16000, output=True)
-        self.chunk = 1024
-
-    def read(self, data):
-        response = self.polly.synthesize_speech(
-            Text=data,
-            Engine=config['polly']['Engine'],
-            LanguageCode=config['polly']['LanguageCode'],
-            VoiceId=config['polly']['VoiceId'],
-            OutputFormat=config['polly']['OutputFormat'],
-        )
-
-        stream = response['AudioStream']
-
-        while True:
-            # Check if user signaled to shutdown Bedrock speech
-            # UserInputManager.start_shutdown_executor() will raise Exception. If not ideas but is functional.
-            if UserInputManager.is_executor_set() and UserInputManager.is_shutdown_scheduled():
-                UserInputManager.start_shutdown_executor()
-
-            data = stream.read(self.chunk)
-            self.audio.write(data)
-            if not data:
-                break
-
-    def close(self):
-        time.sleep(1)
-        self.audio.stop_stream()
-        self.audio.close()
-
-
-# def aws_polly_tts(polly_text):
-#     printer(f'[INTO] Character count: {len(polly_text)}', 'debug')
-#     byte_stream_list = []
-#     polly_text_len = len(polly_text.split('.'))
-#     printer(f'LEN polly_text_len: {polly_text_len}', 'debug')
-#     for i in range(0, polly_text_len, 20):
-#         printer(f'{i}:{i + 20}', 'debug')
-#         polly_text_chunk = '. '.join(polly_text.split('. ')[i:i + 20])
-#         printer(f'polly_text_chunk LEN: {len(polly_text_chunk)}', 'debug')
-
-#         response = polly.synthesize_speech(
-#             Text=polly_text_chunk,
-#             Engine=config['polly']['Engine'],
-#             LanguageCode=config['polly']['LanguageCode'],
-#             VoiceId=config['polly']['VoiceId'],
-#             OutputFormat=config['polly']['OutputFormat'],
-#         )
-#         byte_stream = response['AudioStream']
-#         byte_stream_list.append(byte_stream)
-
-#     byte_chunks = []
-#     chunk = 1024
-#     for bs in byte_stream_list:
-#         while True:
-#             data = bs.read(chunk)
-#             byte_chunks.append(data)
-
-#             if not data:
-#                 bs.close()
-#                 break
-
-#     read_byte_chunks(b''.join(byte_chunks))
-
-
-# def read_byte_chunks(data):
-#     polly_stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, output=True)
-#     polly_stream.write(data)
-
-#     time.sleep(1)
-#     polly_stream.stop_stream()
-#     polly_stream.close()
-#     time.sleep(1)
-
-
-class EventHandler(TranscriptResultStreamHandler):
-    text = []
-    last_time = 0
-    sample_count = 0
-    max_sample_counter = 4
-
-    def __init__(self, transcript_result_stream: TranscriptResultStream, bedrock_wrapper):
-        super().__init__(transcript_result_stream)
-        self.bedrock_wrapper = bedrock_wrapper
-
-    async def handle_transcript_event(self, transcript_event: TranscriptEvent):
-        results = transcript_event.transcript.results
-        if not self.bedrock_wrapper.is_speaking():
-
-            if results:
-                for result in results:
-                    EventHandler.sample_count = 0
-                    if not result.is_partial:
-                        for alt in result.alternatives:
-                            print(alt.transcript, flush=True, end=' ')
-                            EventHandler.text.append(alt.transcript)
-
-            else:
-                EventHandler.sample_count += 1
-                if EventHandler.sample_count == EventHandler.max_sample_counter:
-
-                    # if len(EventHandler.text) == 0:
-                    #     last_speech = config['last_speech']
-                    #     print(last_speech, flush=True)
-                        #aws_polly_tts(last_speech)
-                        #os._exit(0)  # exit from a child process
-                    #else:
-                    if len(EventHandler.text) != 0:    
-                        input_text = ' '.join(EventHandler.text)
-                        printer(f'\n[INFO] User input: {input_text}', 'info')
-
-                        executor = ThreadPoolExecutor(max_workers=1)
-                        # Add executor so Bedrock execution can be shut down, if user input signals so.
-                        UserInputManager.set_executor(executor)
-                        loop.run_in_executor(
-                            executor,
-                            self.bedrock_wrapper.invoke_bedrock,
-                            input_text
-                        )
-
-                    EventHandler.text.clear()
-                    EventHandler.sample_count = 0
-
-
-class MicStream:
-
-    async def mic_stream(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        input_queue = asyncio.Queue()
-
-        def callback(indata, frame_count, time_info, status):
-            loop.call_soon_threadsafe(input_queue.put_nowait, (bytes(indata), status))
-
-        stream = sounddevice.RawInputStream(
-            channels=1, samplerate=16000, callback=callback, blocksize=2048 * 2, dtype="int16")
-        with stream:
-            while True:
-                indata, status = await input_queue.get()
-                yield indata, status
-
-    async def write_chunks(self, stream):
-        async for chunk, status in self.mic_stream():
-            await stream.input_stream.send_audio_event(audio_chunk=chunk)
-
-        await stream.input_stream.end_stream()
-
-    async def text_input_stream(self):
-        while True:
-            try:
-                # 获取用户输入
-                user_input = input("\n请输入您的问题 (输入 'quit' 退出): ")
-                if user_input.lower() == 'quit':
-                    break
-                
-                # 使用 TextOnlyWrapper 处理纯文本输出
-                text_wrapper = TextOnlyWrapper()
-                executor = ThreadPoolExecutor(max_workers=1)
-                UserInputManager.set_executor(executor)
-                await loop.run_in_executor(
-                    executor,
-                    text_wrapper.invoke_bedrock,
-                    user_input
-                )
-                
-            except KeyboardInterrupt:
-                print("\n程序已终止")
-                break
-            except Exception as e:
-                print(f"发生错误: {e}")
-
-    async def basic_transcribe(self):
-        await self.text_input_stream()
-
-
-class TextOnlyWrapper:
-    def __init__(self):
-        self.speaking = False
-
-    def is_speaking(self):
-        return self.speaking
-
-    def invoke_bedrock(self, text):
-        printer('[DEBUG] Bedrock generation started', 'debug')
-        self.speaking = True
-
-        body = BedrockModelsWrapper.define_body(text)
-        printer(f"[DEBUG] Request body: {body}", 'debug')
-
-        try:
-            body_json = json.dumps(body)
-            response = bedrock_runtime.invoke_model_with_response_stream(
-                body=body_json,
-                modelId=config['bedrock']['api_request']['modelId'],
-                accept=config['bedrock']['api_request']['accept'],
-                contentType=config['bedrock']['api_request']['contentType']
-            )
-
-            bedrock_stream = response.get('body')
-            self.process_text_stream(bedrock_stream)
-
-        except Exception as e:
-            print(e)
-            time.sleep(2)
-            self.speaking = False
-
-        self.speaking = False
-        printer('\n[DEBUG] Bedrock generation completed', 'debug')
-
-    def process_text_stream(self, bedrock_stream):
-        if bedrock_stream:
-            for event in bedrock_stream:
-                chunk = BedrockModelsWrapper.get_stream_chunk(event)
-                if chunk:
-                    text = BedrockModelsWrapper.get_stream_text(chunk)
-                    print(text, flush=True, end='')
+            response_text = ''
+            for event in response.get('body'):
+                text_chunk = self.get_response_text(event.get('chunk', {}))
+                if text_chunk:
+                    response_text += text_chunk
+                    print(text_chunk, end='', flush=True)
             print('\n')
 
+            # 将用户输入和模型响应添加到对话历史中
+            self.conversation_history.append(f"用户: {text}")
+            self.conversation_history.append(f"助手: {response_text}")
 
-info_text = f'''
+            # 限制对话历史长度，避免内存溢出
+            if len(self.conversation_history) > 10:
+                self.conversation_history = self.conversation_history[-10:]
+            
+        except Exception as e:
+            print(f"错误: {e}")
+
+def main():
+    print(f'''
 *************************************************************
-[INFO] Supported FM models: {get_model_ids()}.
-[INFO] Change FM model by setting <MODEL_ID> environment variable. Example: export MODEL_ID=meta.llama2-70b-chat-v1
+[INFO] 支持的基础模型: {get_model_ids()}
+[INFO] 通过设置 MODEL_ID 环境变量来更改模型。例如: export MODEL_ID=meta.llama2-70b-chat-v1
 
 [INFO] AWS Region: {config['region']}
-[INFO] Amazon Bedrock model: {config['bedrock']['api_request']['modelId']}
-[INFO] Polly config: engine {config['polly']['Engine']}, voice {config['polly']['VoiceId']}
-[INFO] Log level: {config['log_level']}
+[INFO] Amazon Bedrock 模型: {config['bedrock']['api_request']['modelId']}
+[INFO] 日志级别: {config['log_level']}
 
-[INFO] 现在可以直接在命令行输入文字进行对话！
-[INFO] 输入 'quit' 可以退出程序
+[INFO] 现在可以直接输入文字进行对话！
+[INFO] 输入 'quit' 退出程序
 *************************************************************
-'''
-print(info_text)
+''')
 
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
+    bedrock = BedrockWrapper()
+    
+    while True:
+        try:
+            user_input = input("\n请输入您的问题 (输入 'quit' 退出): ")
+            if user_input.lower() == 'quit':
+                break
+            bedrock.chat(user_input)
+        except KeyboardInterrupt:
+            print("\n程序已终止")
+            break
+        except Exception as e:
+            print(f"发生错误: {e}")
 
-try:
-    loop.run_until_complete(MicStream().basic_transcribe())
-except (KeyboardInterrupt, Exception) as e:
-    print("\n程序已终止")
+main()
