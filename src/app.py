@@ -6,6 +6,76 @@ from api_request_schema import api_request_list, get_model_ids
 import pytesseract
 from PIL import Image
 from langdetect import detect
+from prompt_template import generate_teaching_prompt
+import speech_recognition as sr
+import pyaudio
+# 定语从句教学示例
+grammar_prompt = generate_teaching_prompt(
+    topic="定语从句",
+    core_elements="基本概念、结构和用法",
+    learning_goals="实际应用能力",
+    structure_elements="概念讲解、句型分析、实例讲解",
+    teaching_tools="例句分析",
+    thinking_direction="日常语言中的应用"
+)
+    
+# 第一次世界大战教学示例
+history_prompt = generate_teaching_prompt(
+    topic="第一次世界大战",
+    core_elements="背景、起因、过程和影响",
+    learning_goals="历史思维能力",
+    structure_elements="背景介绍、战争过程、影响分析",
+    teaching_method="启发引导",
+    teaching_tools="历史案例",
+    thinking_direction="对当今世界的影响"
+)
+
+
+# 数学教学示例
+math_prompt = generate_teaching_prompt(
+    topic="二次函数",
+    core_elements="定义、图像、性质",
+    learning_goals="应用能力",
+    structure_elements="定义、图像、性质",
+    teaching_method="启发引导",
+    teaching_tools="分析例题",
+    thinking_direction="实际应用"
+)
+
+# 数据结构
+data_structure_prompt = generate_teaching_prompt(
+    topic="数据结构",
+    core_elements="基本概念、常见数据结构类型、时间复杂度分析",
+    learning_goals="数据结构选择与应用能力",
+    structure_elements="概念讲解、结构分析、性能对比、应用场景",
+    content_requirements="重点突出实际应用",
+    teaching_method="案例分析",
+    teaching_tools="代码示例和性能分析",
+    thinking_direction="如何选择合适的数据结构解决实际问题",
+    interaction_type="编程实践",
+    interaction_goal="培养算法思维",
+    word_count="不少于1000字",
+    language_style="通俗易懂",
+    special_requirements="结合具体编程语言和实际项目案例"
+)
+
+
+# 默认提示词
+default_prompt = """你是一位经验丰富的人民教师，有着20年的教学经验。你的职责是：
+1. 耐心细致地为学生讲解各个学科（数学、编程、数据结构等）的课程内容和习题
+2. 采用循序渐进的教学方式，先确保学生理解基础概念，再逐步深入
+3. 解答问题时要：
+   - 先分析题目要点
+   - 给出清晰的解题思路
+   - 详细说明每一步的原理
+   - 适时补充相关知识点
+4. 鼓励学生思考，引导而不是直接给出答案
+5. 使用亲切友好的语气，营造良好的师生互动氛围
+6. 当遇到学生不理解的地方，要用更通俗易懂的方式重新解释
+
+记住：你的目标不仅是解答问题，更要培养学生的学习兴趣和独立思考能力。"""
+
+prompt = data_structure_prompt
 
 # 基础配置
 model_id = os.getenv('MODEL_ID', 'meta.llama3-70b-instruct-v1')
@@ -35,7 +105,7 @@ def printer(text, level):
 class BedrockWrapper:
     def __init__(self):
         self.init_prompt = [
-            {"role": "system", "content": "你是一位人民教师，你的工作是给学生讲解各个科目的题目。"}
+            {"role": "system", "content": prompt}
         ]
         self.conversation_history = self.init_prompt
 
@@ -48,14 +118,14 @@ class BedrockWrapper:
         # 检测输入语言
         try:
             detected_language = detect(text)
-            #print(f"检测到的语言: {detected_language}")
+            print(f"检测到的语言: {detected_language}")
         except Exception as e:
             print(f"语言检测失败: {e}")
             detected_language = 'zh-cn'  # 默认中文
         
         # 根据检测到的语言设置输出语言
-        output_language = 'Chinese' if detected_language == 'zh-cn' else 'English'
-        #print(f"设置的输出语言: {output_language}")
+        output_language = 'English' if detected_language == 'en' else 'Chinese'
+        print(f"设置的输出语言: {output_language}")
 
         if model_provider == 'amazon':
             body['inputText'] = text
@@ -181,6 +251,48 @@ def process_image(image_name, text_request):
     combined_text = f"{ocr_text}\n\n{text_request}"
     return combined_text
 
+def record_audio():
+    """录制音频并转换为文字"""
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("请开始说话...")
+        try:
+            audio = r.listen(source, timeout=5, phrase_time_limit=10)
+            print("正在识别...")
+            
+            # 首先尝试中文识别
+            try:
+                text = r.recognize_google(audio, language='zh-CN')
+                return text
+            except:
+                # 如果中文识别失败，尝试英文识别
+                try:
+                    text = r.recognize_google(audio, language='en-US')
+                    return text
+                except sr.UnknownValueError:
+                    print("无法识别您的语音")
+                    return None
+                except sr.RequestError as e:
+                    print(f"无法连接到 Google 语音识别服务：{e}")
+                    return None
+        except sr.WaitTimeoutError:
+            print("没有检测到语音输入")
+            return None
+        except Exception as e:
+            print(f"发生错误：{e}")
+            return None
+
+def get_multiline_input():
+    """获取多行输入，直到用户输入空行为止"""
+    print("请输入内容（输入空行结束）：")
+    lines = []
+    while True:
+        line = input()
+        if line.strip() == "":
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
 def main():
     print(f'''
 *************************************************************
@@ -191,8 +303,12 @@ def main():
 [INFO] Amazon Bedrock 模型: {config['bedrock']['api_request']['modelId']}
 [INFO] 日志级别: {config['log_level']}
 
-[INFO] 现在可以直接输入文字进行对话！
-[INFO] 输入 'quit' 退出程序
+[INFO] 使用说明：
+- 输入 'quit' 退出程序
+- 输入 'clear' 清除对话历史
+- 输入 'speak' 使用语音输入
+- 输入 'multi' 进入多行输入模式
+- 输入 'img 图片名称 文字需求' 处理图片
 *************************************************************
 ''')
 
@@ -200,15 +316,29 @@ def main():
     
     while True:
         try:
-            user_input = input("\n请输入您的问题或命令 (输入 'quit' 退出, 'clear' 清除历史): ")
+            user_input = input("\n请输入您的问题或命令: ")
+            
             if user_input.lower() == 'quit':
                 break
             elif user_input.lower() == 'clear':
-                bedrock.conversation_history = bedrock.init_prompt
+                bedrock.conversation_history = [
+                    {"role": "system", "content": prompt}
+                ]
                 print("已清除对话历史")
                 continue
+            elif user_input.lower() == 'speak':
+                text = record_audio()
+                if text:
+                    print(f"识别到的文字: {text}")
+                    bedrock.chat(text)
+                continue
+            elif user_input.lower() == 'multi':
+                text = get_multiline_input()
+                if text.strip():
+                    bedrock.chat(text)
+                continue
             
-            if user_input.startswith('img '):  # 检测 img 命令
+            if user_input.startswith('img '):
                 parts = user_input.split(' ', 2)
                 if len(parts) < 3:
                     print("命令格式错误，应为: img 图片名称 文字需求")
